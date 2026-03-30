@@ -5,7 +5,7 @@ from playwright.sync_api import sync_playwright
 
 DOWNLOAD_DIR = "downloads"
 USER_DATA_DIR = "data"
-GROUPS = ["Alina", "Cool people club"]  # Update to your groups
+GROUPS = ["Alina", "Cool people club"]  # Update with your groups
 MAX_IMAGES_IF_NO_LAST = 50
 SCROLLS_PER_GROUP = 10
 
@@ -41,6 +41,26 @@ def get_last_downloaded_timestamp(folder):
     return max(timestamps) if timestamps else None
 
 
+def wait_for_new_blob(img_element, previous_src=None, timeout=5000):
+    """
+    Wait until the img element's src attribute changes (new blob).
+    """
+    start_time = time.time()
+    while True:
+        src = img_element.get_attribute("src")
+        if src and src.startswith("blob:") and src != previous_src:
+            return src
+        if (time.time() - start_time) * 1000 > timeout:
+            return None
+        time.sleep(0.1)
+
+
+def scroll_to_load_images(page, scrolls=SCROLLS_PER_GROUP):
+    for _ in range(scrolls):
+        page.keyboard.press("PageUp")
+        time.sleep(0.1)
+
+
 def run():
     with sync_playwright() as p:
         browser = p.chromium.launch_persistent_context(USER_DATA_DIR, headless=False)
@@ -62,7 +82,7 @@ def run():
             else:
                 print("[i] No previous downloads found")
 
-            # Search for the group
+            # Refocus search bar
             search_bar.scroll_into_view_if_needed()
             search_bar.click()
             search_bar.fill("")
@@ -77,7 +97,7 @@ def run():
             chat.first.click()
             time.sleep(1)
 
-            # Click group header to open profile
+            # Click group header to open media
             header_button = page.locator('div[title="Profile details"]').first
             header_button.click()
             time.sleep(1)
@@ -92,17 +112,26 @@ def run():
             first_image.click()
             time.sleep(1)
 
+            # Navigate images in modal and save
             downloaded_count = 0
+            previous_src = None
+
             while True:
                 try:
-                    # Current image in modal
                     img = page.locator('img[draggable="true"]').first
-                    src = img.get_attribute("src")
-                    if not src or not src.startswith("blob:"):
-                        print("[i] No blob image found, exiting.")
-                        break
+                    src = wait_for_new_blob(img, previous_src)
 
-                    # Download image
+                    if not src:
+                        print("[i] Waiting 3s for more images to load...")
+                        time.sleep(3)
+                        src = wait_for_new_blob(img, previous_src, timeout=3000)
+                        if not src:
+                            print("[i] End of images. Exiting modal.")
+                            break
+
+                    previous_src = src
+
+                    # Save image
                     data_url = page.evaluate(
                         """async (src) => {
                             const res = await fetch(src);
@@ -120,24 +149,24 @@ def run():
                         downloaded_count += 1
                         print(f"[✓] Saved image #{downloaded_count}")
 
-                    # Stop condition
                     if not last_ts and downloaded_count >= MAX_IMAGES_IF_NO_LAST:
                         print(f"[i] Reached {MAX_IMAGES_IF_NO_LAST} images. Stopping.")
                         break
 
-                    # Move to previous image using left arrow
+                    # Click left arrow to go to previous image
                     left_arrow = page.locator('button[aria-label="Previous"]').first
-                    if left_arrow.count() == 0 or not left_arrow.is_visible():
-                        print("[i] No more images to the left. Exiting.")
+                    if left_arrow.count() == 0 or not left_arrow.is_visible() or left_arrow.is_disabled():
+                        print("[i] Reached the first image in the chat. Exiting modal.")
                         break
+
                     left_arrow.click()
-                    time.sleep(0.5)
+                    time.sleep(0.1)
 
                 except Exception as e:
                     print(f"[!] Error navigating/saving images: {e}")
                     break
 
-            # Close modal
+            # Close modal after finishing images
             try:
                 close_btn = page.locator('span[aria-hidden="true"][data-icon="ic-close"]').first
                 close_btn.click()
@@ -145,7 +174,7 @@ def run():
             except:
                 pass
 
-            # Prepare search bar for next group
+            # Go back to search bar for next group
             search_bar.click()
             search_bar.fill("")
 
