@@ -18,13 +18,17 @@ def ensure_folder(name):
 
 
 def save_base64_image(data_url, folder):
-    header, encoded = data_url.split(",", 1)
-    data = base64.b64decode(encoded)
-    filename = f"{int(time.time() * 1000)}.jpg"
-    filepath = os.path.join(folder, filename)
-    with open(filepath, "wb") as f:
-        f.write(data)
-    return filename
+    try:
+        header, encoded = data_url.split(",", 1)
+        data = base64.b64decode(encoded)
+        filename = f"{int(time.time() * 1000)}.jpg"
+        filepath = os.path.join(folder, filename)
+        with open(filepath, "wb") as f:
+            f.write(data)
+        return filename
+    except Exception as e:
+        print(f"[!] Failed to save image: {e}")
+        return None
 
 
 def get_last_downloaded_timestamp(folder):
@@ -42,14 +46,15 @@ def get_last_downloaded_timestamp(folder):
 
 
 def wait_for_new_blob(img_element, previous_src=None, timeout=5000):
-    """
-    Wait until the img element's src attribute changes (new blob).
-    """
     start_time = time.time()
     while True:
-        src = img_element.get_attribute("src")
-        if src and src.startswith("blob:") and src != previous_src:
-            return src
+        try:
+            src = img_element.get_attribute("src")
+            if src and src.startswith("blob:") and src != previous_src:
+                return src
+        except:
+            pass
+
         if (time.time() - start_time) * 1000 > timeout:
             return None
         time.sleep(0.1)
@@ -59,6 +64,18 @@ def scroll_to_load_images(page, scrolls=SCROLLS_PER_GROUP):
     for _ in range(scrolls):
         page.keyboard.press("PageUp")
         time.sleep(0.1)
+
+
+def click_previous(page):
+    try:
+        left_arrow = page.locator('button[aria-label="Previous"]').first
+        if left_arrow.count() > 0 and left_arrow.is_visible() and not left_arrow.is_disabled():
+            left_arrow.click()
+            time.sleep(0.2)
+            return True
+    except:
+        pass
+    return False
 
 
 def run():
@@ -77,12 +94,13 @@ def run():
 
             folder = ensure_folder(group)
             last_ts = get_last_downloaded_timestamp(folder)
+
             if last_ts:
                 print(f"[i] Last downloaded timestamp: {last_ts}")
             else:
                 print("[i] No previous downloads found")
 
-            # Refocus search bar
+            # Search group
             search_bar.scroll_into_view_if_needed()
             search_bar.click()
             search_bar.fill("")
@@ -94,25 +112,28 @@ def run():
             if chat.count() == 0:
                 print("[!] Group not found")
                 continue
+
             chat.first.click()
             time.sleep(1)
 
-            # Click group header to open media
+            # Open media panel
             header_button = page.locator('div[title="Profile details"]').first
             header_button.click()
             time.sleep(1)
 
-            # Click "Media" tab
             media_tab = page.locator('div[role="button"]:has-text("Media")').first
             media_tab.click()
             time.sleep(2)
 
-            # Open first image in media gallery
+            # Open first image
             first_image = page.locator('div.x1xsqp64').first
+            if first_image.count() == 0:
+                print("[!] No images found in this group")
+                continue
+
             first_image.click()
             time.sleep(1)
 
-            # Navigate images in modal and save
             downloaded_count = 0
             previous_src = None
 
@@ -121,52 +142,64 @@ def run():
                     img = page.locator('img[draggable="true"]').first
                     src = wait_for_new_blob(img, previous_src)
 
+                    # ✅ Skip if no src
                     if not src:
-                        print("[i] Waiting 3s for more images to load...")
-                        time.sleep(3)
-                        src = wait_for_new_blob(img, previous_src, timeout=3000)
-                        if not src:
-                            print("[i] End of images. Exiting modal.")
+                        print("[!] No valid image src found, skipping...")
+                        if click_previous(page):
+                            continue
+                        else:
+                            print("[i] Cannot move further. Exiting modal.")
                             break
 
                     previous_src = src
 
-                    # Save image
-                    data_url = page.evaluate(
-                        """async (src) => {
-                            const res = await fetch(src);
-                            const blob = await res.blob();
-                            return await new Promise(resolve => {
-                                const reader = new FileReader();
-                                reader.onloadend = () => resolve(reader.result);
-                                reader.readAsDataURL(blob);
-                            });
-                        }""",
-                        src
-                    )
-                    if data_url:
-                        save_base64_image(data_url, folder)
-                        downloaded_count += 1
-                        print(f"[✓] Saved image #{downloaded_count}")
+                    # Fetch image data
+                    try:
+                        data_url = page.evaluate(
+                            """async (src) => {
+                                try {
+                                    const res = await fetch(src);
+                                    const blob = await res.blob();
+                                    return await new Promise(resolve => {
+                                        const reader = new FileReader();
+                                        reader.onloadend = () => resolve(reader.result);
+                                        reader.readAsDataURL(blob);
+                                    });
+                                } catch {
+                                    return null;
+                                }
+                            }""",
+                            src
+                        )
+                    except:
+                        data_url = None
 
+                    # ✅ Skip if fetch failed
+                    if not data_url:
+                        print("[!] Failed to fetch image data, skipping...")
+                    else:
+                        saved = save_base64_image(data_url, folder)
+                        if saved:
+                            downloaded_count += 1
+                            print(f"[✓] Saved image #{downloaded_count}")
+
+                    # Stop condition
                     if not last_ts and downloaded_count >= MAX_IMAGES_IF_NO_LAST:
                         print(f"[i] Reached {MAX_IMAGES_IF_NO_LAST} images. Stopping.")
                         break
 
-                    # Click left arrow to go to previous image
-                    left_arrow = page.locator('button[aria-label="Previous"]').first
-                    if left_arrow.count() == 0 or not left_arrow.is_visible() or left_arrow.is_disabled():
-                        print("[i] Reached the first image in the chat. Exiting modal.")
+                    # Move to next image
+                    if not click_previous(page):
+                        print("[i] Reached the first image. Exiting modal.")
                         break
-
-                    left_arrow.click()
-                    time.sleep(0.1)
 
                 except Exception as e:
                     print(f"[!] Error navigating/saving images: {e}")
+                    if click_previous(page):
+                        continue
                     break
 
-            # Close modal after finishing images
+            # Close modal
             try:
                 close_btn = page.locator('span[aria-hidden="true"][data-icon="ic-close"]').first
                 close_btn.click()
@@ -174,7 +207,7 @@ def run():
             except:
                 pass
 
-            # Go back to search bar for next group
+            # Reset search
             search_bar.click()
             search_bar.fill("")
 
