@@ -18,7 +18,7 @@ model = AutoModelForImageTextToText.from_pretrained(
     model_id,
     device_map="auto",
     dtype=torch.float16 if torch.cuda.is_available() else torch.float32
-    )
+)
 
 processor = AutoProcessor.from_pretrained(model_id)
 
@@ -72,7 +72,7 @@ def extract_image(image: str | Image.Image | Path, prompt: str = 'Extract {"orde
             **inputs, max_new_tokens=_MAX_NEW_TOKENS,
             pad_token_id=model.config.pad_token_id,
             eos_token_id=model.config.eos_token_id
-            )
+        )
 
     result = processor.batch_decode(
         output[:, inputs.input_ids.shape[-1]:],
@@ -83,27 +83,32 @@ def extract_image(image: str | Image.Image | Path, prompt: str = 'Extract {"orde
 
 def estimate_image_peak_mem(image_path: Path, prompt: str) -> tuple[int, str]:
     """
-    Estimates peak memory for a single image, returns (peak_mem_in_bytes, result)
-    Works for both CPU (psutil) and GPU
+    Estimates peak memory for a single image relative to current GPU usage.
+    Returns (peak_mem_in_bytes, result)
     """
     if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats(model.device)
+        device = model.device
+        mem_before = torch.cuda.memory_allocated(device)
+        torch.cuda.reset_peak_memory_stats(device)  
+
         result = extract_image(image_path, prompt)
-        peak_mem = torch.cuda.max_memory_allocated(model.device)
+
+        peak_mem = torch.cuda.max_memory_allocated(device)
+        peak_mem_delta = peak_mem - mem_before
 
     elif _PSUTIL:
         process = psutil.Process()
         mem_before = process.memory_info().rss
         result = extract_image(image_path, prompt)
         mem_after = process.memory_info().rss
-        peak_mem = mem_after - mem_before
+        peak_mem_delta = mem_after - mem_before
 
     else:
         result = extract_image(image_path, prompt)
-        peak_mem = 1e9  # fallback ~1GB
-    peak_mem = max(peak_mem, 1e6)
+        peak_mem_delta = 1e9  # fallback ~1GB
 
-    return peak_mem, result
+    peak_mem_delta = max(int(peak_mem_delta), 1_000_000)
+    return peak_mem_delta, result
 
 def compute_batch_size(image_path: Path, prompt: str, safety_factor: float = 0.8) -> int:
     peak_mem, result = estimate_image_peak_mem(image_path, prompt)
@@ -117,7 +122,7 @@ def compute_batch_size(image_path: Path, prompt: str, safety_factor: float = 0.8
             "it is likely you are unintentionally using the CPU. "
             "unable to estimate available ram, assuming 1gb!",
             UserWarning
-            )
+        )
         free_mem = 1e9 
 
     batch_size = max(1, int(free_mem * safety_factor / peak_mem))
@@ -130,31 +135,34 @@ def apply_template(msg):
         add_generation_prompt=True
     )
 
-def batch_extract_image(images: list[Path], prompt: str = 'Extract {"order_id": "", "order_date": ""} from this image. Return JSON only.'):
+def batch_extract_image_prefetch(images: list[Path], prompt: str = 'Extract {"order_id": "", "order_date": ""} from this image. Return JSON only.', prefetch_batches: int = 2):
     """
-    Generator version of batch extraction.
-    Yields results one by one, preserving order.
+    Generator version of batch extraction with prefetching.
+    Prepares up to `prefetch_batches` ahead while GPU is generating the current batch.
     """
+    from queue import Queue
+    from threading import Thread
 
     images = [p for p in images if p.suffix.lower() in [".png", ".jpg", ".jpeg"]]
-
     if not images:
         return
 
-
     batch_size, first_result = compute_batch_size(images[0], prompt)
+    yield first_result  # yield first image result
 
-    yield first_result
+    # Queue to store prepared batches
+    batch_queue = Queue(maxsize=prefetch_batches)
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        for i in range(1, len(images), batch_size):
-            batch_paths = images[i:i+batch_size]
+    def prepare_batch(batch_paths):
+        """Load images and apply template in parallel"""
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            # Load images in parallel
+            def load_image(path):
+                with Image.open(path) as img:
+                    return img.copy()
+            pil_images = list(executor.map(load_image, batch_paths))
 
-            pil_images = []
-            for p in batch_paths:
-                with Image.open(p) as img:
-                    pil_images.append(img.copy())
-        
+            # Create messages
             messages_batch = [
                 [{
                     "role": "user",
@@ -166,32 +174,54 @@ def batch_extract_image(images: list[Path], prompt: str = 'Extract {"order_id": 
                 for img in pil_images
             ]
 
+            # Apply template in parallel
             texts = list(executor.map(apply_template, messages_batch))
 
-            image_inputs, _ = process_vision_info(messages_batch)
+        # Prepare tensor inputs (CPU -> GPU)
+        image_inputs, _ = process_vision_info(messages_batch)
+        inputs = processor(
+            text=texts,
+            images=image_inputs,
+            return_tensors="pt",
+            padding=True
+        ).to(model.device)
 
-            inputs = processor(
-                text=texts,
-                images=image_inputs,
-                return_tensors="pt",
-                padding=True
-            ).to(model.device)
+        return inputs
 
-            with torch.inference_mode():
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=_MAX_NEW_TOKENS,
-                    pad_token_id=model.config.pad_token_id,
-                    eos_token_id=model.config.eos_token_id
-                )
+    # Prefetch thread
+    def prefetch_worker():
+        for i in range(1, len(images), batch_size):
+            batch_paths = images[i:i+batch_size]
+            inputs = prepare_batch(batch_paths)
+            batch_queue.put(inputs)
+        # signal the end
+        batch_queue.put(None)
 
-            decoded = processor.batch_decode(
-                outputs[:, inputs.input_ids.shape[-1]:],
-                skip_special_tokens=True
+    # Start prefetching thread
+    thread = Thread(target=prefetch_worker, daemon=True)
+    thread.start()
+
+    # Consume prepared batches
+    while True:
+        inputs = batch_queue.get()
+        if inputs is None:
+            break
+
+        with torch.inference_mode():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=_MAX_NEW_TOKENS,
+                pad_token_id=model.config.pad_token_id,
+                eos_token_id=model.config.eos_token_id
             )
 
-            for d in decoded:
-                yield clean_json_output(d)
+        decoded = processor.batch_decode(
+            outputs[:, inputs.input_ids.shape[-1]:],
+            skip_special_tokens=True
+        )
+
+        for d in decoded:
+            yield clean_json_output(d)
 
 if __name__ == "__main__":
     directory = Path("./Images")
@@ -199,7 +229,7 @@ if __name__ == "__main__":
     # for picture in pictures:
     #    print(extract_image(picture))
 
-    print("\n\nTesting Batch Mode!\n\n")
+    print("\n\nTesting Prefetch Batch Mode!\n\n")
 
-    for result in     batch_extract_image(pictures):
+    for result in batch_extract_image_prefetch(pictures):
         print(result)
