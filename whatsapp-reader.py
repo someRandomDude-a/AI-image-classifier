@@ -1,11 +1,12 @@
 import os
 import time
 import base64
+import hashlib
 from playwright.sync_api import sync_playwright
 
 DOWNLOAD_DIR = "downloads"
 USER_DATA_DIR = "data"
-GROUPS = ["Alina", "Cool people club"]  # Update with your groups
+GROUPS = ["Alina", "Cool people club"]
 MAX_IMAGES_IF_NO_LAST = 50
 SCROLLS_PER_GROUP = 10
 
@@ -17,32 +18,27 @@ def ensure_folder(name):
     return path
 
 
-def save_base64_image(data_url, folder):
-    try:
-        header, encoded = data_url.split(",", 1)
-        data = base64.b64decode(encoded)
-        filename = f"{int(time.time() * 1000)}.jpg"
-        filepath = os.path.join(folder, filename)
-        with open(filepath, "wb") as f:
-            f.write(data)
-        return filename
-    except Exception as e:
-        print(f"[!] Failed to save image: {e}")
-        return None
+# 🔐 Hash helper
+def hash_bytes(data):
+    return hashlib.md5(data).hexdigest()
 
 
-def get_last_downloaded_timestamp(folder):
+# 📂 Load existing image hashes
+def load_existing_hashes(folder):
+    hashes = set()
     if not os.path.exists(folder):
-        return None
-    timestamps = []
+        return hashes
+
     for f in os.listdir(folder):
         if f.endswith(".jpg"):
+            path = os.path.join(folder, f)
             try:
-                ts = int(os.path.splitext(f)[0])
-                timestamps.append(ts)
+                with open(path, "rb") as img:
+                    hashes.add(hash_bytes(img.read()))
             except:
                 continue
-    return max(timestamps) if timestamps else None
+
+    return hashes
 
 
 def wait_for_new_blob(img_element, previous_src=None, timeout=5000):
@@ -93,10 +89,12 @@ def run():
             print(f"\n--- {group} ---")
 
             folder = ensure_folder(group)
-            last_ts = get_last_downloaded_timestamp(folder)
 
-            if last_ts:
-                print(f"[i] Last downloaded timestamp: {last_ts}")
+            # 🔑 Load existing hashes
+            existing_hashes = load_existing_hashes(folder)
+
+            if existing_hashes:
+                print(f"[i] Loaded {len(existing_hashes)} existing images")
             else:
                 print("[i] No previous downloads found")
 
@@ -142,7 +140,6 @@ def run():
                     img = page.locator('img[draggable="true"]').first
                     src = wait_for_new_blob(img, previous_src)
 
-                    # ✅ Skip if no src
                     if not src:
                         print("[!] No valid image src found, skipping...")
                         if click_previous(page):
@@ -174,18 +171,39 @@ def run():
                     except:
                         data_url = None
 
-                    # ✅ Skip if fetch failed
                     if not data_url:
                         print("[!] Failed to fetch image data, skipping...")
                     else:
-                        saved = save_base64_image(data_url, folder)
-                        if saved:
+                        try:
+                            header, encoded = data_url.split(",", 1)
+                            data = base64.b64decode(encoded)
+                        except:
+                            print("[!] Failed to decode image")
+                            data = None
+
+                        if data:
+                            img_hash = hash_bytes(data)
+
+                            # 🛑 STOP when hitting old images
+                            if img_hash in existing_hashes:
+                                print("[i] Found already-downloaded image. Stopping.")
+                                break
+
+                            # 💾 Save new image
+                            filename = f"{int(time.time() * 1000)}.jpg"
+                            filepath = os.path.join(folder, filename)
+
+                            with open(filepath, "wb") as f:
+                                f.write(data)
+
+                            existing_hashes.add(img_hash)
                             downloaded_count += 1
+
                             print(f"[✓] Saved image #{downloaded_count}")
 
-                    # Stop condition
-                    if not last_ts and downloaded_count >= MAX_IMAGES_IF_NO_LAST:
-                        print(f"[i] Reached {MAX_IMAGES_IF_NO_LAST} images. Stopping.")
+                    # 🛑 Safety cap
+                    if downloaded_count >= MAX_IMAGES_IF_NO_LAST:
+                        print(f"[i] Reached safety cap ({MAX_IMAGES_IF_NO_LAST}). Stopping.")
                         break
 
                     # Move to next image
