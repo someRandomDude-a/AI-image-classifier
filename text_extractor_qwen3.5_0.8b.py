@@ -5,6 +5,7 @@ from PIL import Image
 from pathlib import Path
 import warnings
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     import psutil
@@ -26,7 +27,6 @@ model.config.pad_token_id = tokenizer.pad_token_id
 model.config.eos_token_id = tokenizer.eos_token_id
 
 model.eval()
-model = torch.compile(model)
 
 _MAX_NEW_TOKENS = 64
 
@@ -101,6 +101,7 @@ def estimate_image_peak_mem(image_path: Path, prompt: str) -> tuple[int, str]:
     else:
         result = extract_image(image_path, prompt)
         peak_mem = 1e9  # fallback ~1GB
+    peak_mem = max(peak_mem, 1e6)
 
     return peak_mem, result
 
@@ -122,37 +123,62 @@ def compute_batch_size(image_path: Path, prompt: str, safety_factor: float = 0.8
     batch_size = max(1, int(free_mem * safety_factor / peak_mem))
     return batch_size, result
 
-def batch_extract_image(images: list[Path], prompt: str = 'Extract {"order_id": "", "order_date": ""} from this image. Return JSON only.') -> list[str]:
+def apply_template(msg):
+    return processor.apply_chat_template(
+        msg,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+
+def batch_extract_image(images: list[Path], prompt: str = 'Extract {"order_id": "", "order_date": ""} from this image. Return JSON only.'):
     """
-    Extracts text from a list of Path objects with automatic batching
-    Returns a list of strings, preserving the order of the input list
+    Generator version of batch extraction.
+    Yields results one by one, preserving order.
     """
+
+    images = [p for p in images if p.suffix.lower() in [".png", ".jpg", ".jpeg"]]
 
     if not images:
-        return []
+        return
+
 
     batch_size, first_result = compute_batch_size(images[0], prompt)
-    results = [first_result]
 
-    for i in range(1, len(images), batch_size):
-        batch = images[i:i+batch_size]
-        for image_path in batch:
-            image = Image.open(image_path)
-            messages = [
-                {
+    yield first_result
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        for i in range(1, len(images), batch_size):
+            batch_paths = images[i:i+batch_size]
+
+            pil_images = []
+            for p in batch_paths:
+                with Image.open(p) as img:
+                    pil_images.append(img.copy())
+        
+            messages_batch = [
+                [{
                     "role": "user",
                     "content": [
-                        {"type": "image", "image": image},
+                        {"type": "image", "image": img},
                         {"type": "text", "text": prompt}
                     ]
-                }
+                }]
+                for img in pil_images
             ]
-            text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            image_inputs, _ = process_vision_info(messages)
-            inputs = processor(text=[text], images=image_inputs, return_tensors="pt").to(model.device)
+
+            texts = list(executor.map(apply_template, messages_batch))
+
+            image_inputs, _ = process_vision_info(messages_batch)
+
+            inputs = processor(
+                text=texts,
+                images=image_inputs,
+                return_tensors="pt",
+                padding=True
+            ).to(model.device)
 
             with torch.inference_mode():
-                output = model.generate(
+                outputs = model.generate(
                     **inputs,
                     max_new_tokens=_MAX_NEW_TOKENS,
                     pad_token_id=model.config.pad_token_id,
@@ -160,20 +186,20 @@ def batch_extract_image(images: list[Path], prompt: str = 'Extract {"order_id": 
                 )
 
             decoded = processor.batch_decode(
-                output[:, inputs.input_ids.shape[-1]:],
+                outputs[:, inputs.input_ids.shape[-1]:],
                 skip_special_tokens=True
-            )[0]
+            )
 
-            results.append(clean_json_output(decoded))
-
-    return results
+            for d in decoded:
+                yield clean_json_output(d)
 
 if __name__ == "__main__":
     directory = Path("./Images")
     pictures = sorted(directory.iterdir())
-    for picture in pictures:
-        print(extract_image(picture))
+    # for picture in pictures:
+    #    print(extract_image(picture))
+
     print("\n\nTesting Batch Mode!\n\n")
-    results = batch_extract_image(pictures)
-    for result in results:
+
+    for result in     batch_extract_image(pictures):
         print(result)
