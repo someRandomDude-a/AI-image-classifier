@@ -1,2 +1,5 @@
 /Images
 *.pyc
+/data
+/downloads
+.env
