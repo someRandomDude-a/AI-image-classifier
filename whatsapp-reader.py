@@ -5,9 +5,9 @@ from playwright.sync_api import sync_playwright
 
 DOWNLOAD_DIR = "downloads"
 USER_DATA_DIR = "data"
-GROUPS = ["Alina", "Cool people club"]
+GROUPS = ["Alina", "Cool people club"]  # Update to your groups
 MAX_IMAGES_IF_NO_LAST = 50
-SCROLLS_PER_GROUP = 20
+SCROLLS_PER_GROUP = 10
 
 
 def ensure_folder(name):
@@ -41,28 +41,6 @@ def get_last_downloaded_timestamp(folder):
     return max(timestamps) if timestamps else None
 
 
-def scroll_to_load_images(page, scrolls=SCROLLS_PER_GROUP):
-    for _ in range(scrolls):
-        page.keyboard.press("PageUp")
-        time.sleep(0.1)
-
-
-def click_download_buttons(page):
-    clicked = set()
-    buttons = page.locator('div[role="button"] svg[aria-label="Download"]')
-    for i in range(buttons.count()):
-        try:
-            btn = buttons.nth(i).locator('xpath=..')
-            btn_id = btn.evaluate("el => el.outerHTML")
-            if btn_id in clicked:
-                continue
-            btn.click()
-            clicked.add(btn_id)
-            time.sleep(0.1)
-        except:
-            continue
-
-
 def run():
     with sync_playwright() as p:
         browser = p.chromium.launch_persistent_context(USER_DATA_DIR, headless=False)
@@ -70,28 +48,27 @@ def run():
         page.goto("https://web.whatsapp.com")
 
         print("Waiting for login...")
-        # Locate the search bar once at login
-        search_bar = page.locator('input[role="textbox"][type="text"]')
+        search_bar = page.locator('input[aria-label]')
         search_bar.wait_for(state="visible", timeout=0)
         print("Logged in!")
 
-        last_group = None
-
         for group in GROUPS:
             print(f"\n--- {group} ---")
+
             folder = ensure_folder(group)
             last_ts = get_last_downloaded_timestamp(folder)
-            print(f"[i] Last downloaded timestamp: {last_ts}" if last_ts else "[i] No previous downloads found")
+            if last_ts:
+                print(f"[i] Last downloaded timestamp: {last_ts}")
+            else:
+                print("[i] No previous downloads found")
 
-            # Focus search bar and clear previous text (previous group)
+            # Search for the group
             search_bar.scroll_into_view_if_needed()
             search_bar.click()
-            search_bar.fill("")  # Clear previous group text
-            time.sleep(0.1)
-            page.keyboard.press("Escape")  # ensure not typing into chat
-            search_bar.click()
+            search_bar.fill("")
+            time.sleep(0.3)
             search_bar.type(group, delay=100)
-            time.sleep(1.5)
+            time.sleep(2)
 
             chat = page.locator(f'span[title="{group}"]')
             if chat.count() == 0:
@@ -100,54 +77,77 @@ def run():
             chat.first.click()
             time.sleep(1)
 
-            # Scroll and download images
-            scroll_to_load_images(page)
-            click_download_buttons(page)
+            # Click group header to open profile
+            header_button = page.locator('div[title="Profile details"]').first
+            header_button.click()
             time.sleep(1)
 
-            images = page.locator('div[data-testid="media-message"] img')
-            count = images.count()
-            print(f"[i] Found {count} image candidates")
+            # Click "Media" tab
+            media_tab = page.locator('div[role="button"]:has-text("Media")').first
+            media_tab.click()
+            time.sleep(2)
+
+            # Open first image in media gallery
+            first_image = page.locator('div.x1xsqp64').first
+            first_image.click()
+            time.sleep(1)
+
             downloaded_count = 0
-
-            for i in range(count - 1, -1, -1):
+            while True:
                 try:
-                    src = images.nth(i).get_attribute("src")
+                    # Current image in modal
+                    img = page.locator('img[draggable="true"]').first
+                    src = img.get_attribute("src")
                     if not src or not src.startswith("blob:"):
-                        continue
+                        print("[i] No blob image found, exiting.")
+                        break
 
+                    # Download image
                     data_url = page.evaluate(
                         """async (src) => {
-                            try {
-                                const res = await fetch(src);
-                                const blob = await res.blob();
-                                return await new Promise(resolve => {
-                                    const reader = new FileReader();
-                                    reader.onloadend = () => resolve(reader.result);
-                                    reader.readAsDataURL(blob);
-                                });
-                            } catch { return null; }
+                            const res = await fetch(src);
+                            const blob = await res.blob();
+                            return await new Promise(resolve => {
+                                const reader = new FileReader();
+                                reader.onloadend = () => resolve(reader.result);
+                                reader.readAsDataURL(blob);
+                            });
                         }""",
                         src
                     )
-                    if not data_url:
-                        continue
+                    if data_url:
+                        save_base64_image(data_url, folder)
+                        downloaded_count += 1
+                        print(f"[✓] Saved image #{downloaded_count}")
 
-                    now_ts = int(time.time() * 1000)
-                    if last_ts and now_ts <= last_ts:
-                        print("[i] Reached last downloaded image. Stopping.")
-                        break
-
-                    save_base64_image(data_url, folder)
-                    downloaded_count += 1
-                    print("[✓] Saved image")
+                    # Stop condition
                     if not last_ts and downloaded_count >= MAX_IMAGES_IF_NO_LAST:
                         print(f"[i] Reached {MAX_IMAGES_IF_NO_LAST} images. Stopping.")
                         break
-                except Exception as e:
-                    print("Error:", e)
 
-            last_group = group
+                    # Move to previous image using left arrow
+                    left_arrow = page.locator('button[aria-label="Previous"]').first
+                    if left_arrow.count() == 0 or not left_arrow.is_visible():
+                        print("[i] No more images to the left. Exiting.")
+                        break
+                    left_arrow.click()
+                    time.sleep(0.5)
+
+                except Exception as e:
+                    print(f"[!] Error navigating/saving images: {e}")
+                    break
+
+            # Close modal
+            try:
+                close_btn = page.locator('span[aria-hidden="true"][data-icon="ic-close"]').first
+                close_btn.click()
+                time.sleep(0.5)
+            except:
+                pass
+
+            # Prepare search bar for next group
+            search_bar.click()
+            search_bar.fill("")
 
         print("\nDone. Waiting 10s before closing...")
         time.sleep(10)
