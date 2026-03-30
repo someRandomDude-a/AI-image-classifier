@@ -23,6 +23,7 @@ model = AutoModelForImageTextToText.from_pretrained(
 processor = AutoProcessor.from_pretrained(model_id)
 
 tokenizer = processor.tokenizer
+tokenizer.padding_side = "left"
 model.config.pad_token_id = tokenizer.pad_token_id
 model.config.eos_token_id = tokenizer.eos_token_id
 
@@ -134,7 +135,9 @@ def apply_template(msg):
         tokenize=False,
         add_generation_prompt=True
     )
-
+def load_image(path):
+    with Image.open(path) as img:
+        return img.copy()
 def batch_extract_image_prefetch(images: list[Path], prompt: str = 'Extract {"order_id": "", "order_date": ""} from this image. Return JSON only.', prefetch_batches: int = 2):
     """
     Generator version of batch extraction with prefetching.
@@ -148,21 +151,16 @@ def batch_extract_image_prefetch(images: list[Path], prompt: str = 'Extract {"or
         return
 
     batch_size, first_result = compute_batch_size(images[0], prompt)
-    yield first_result  # yield first image result
+    yield first_result
 
-    # Queue to store prepared batches
     batch_queue = Queue(maxsize=prefetch_batches)
 
     def prepare_batch(batch_paths):
         """Load images and apply template in parallel"""
         with ThreadPoolExecutor(max_workers=8) as executor:
-            # Load images in parallel
-            def load_image(path):
-                with Image.open(path) as img:
-                    return img.copy()
+            
             pil_images = list(executor.map(load_image, batch_paths))
 
-            # Create messages
             messages_batch = [
                 [{
                     "role": "user",
@@ -174,10 +172,8 @@ def batch_extract_image_prefetch(images: list[Path], prompt: str = 'Extract {"or
                 for img in pil_images
             ]
 
-            # Apply template in parallel
             texts = list(executor.map(apply_template, messages_batch))
 
-        # Prepare tensor inputs (CPU -> GPU)
         image_inputs, _ = process_vision_info(messages_batch)
         inputs = processor(
             text=texts,
@@ -188,7 +184,6 @@ def batch_extract_image_prefetch(images: list[Path], prompt: str = 'Extract {"or
 
         return inputs
 
-    # Prefetch thread
     def prefetch_worker():
         for i in range(1, len(images), batch_size):
             batch_paths = images[i:i+batch_size]
@@ -197,11 +192,9 @@ def batch_extract_image_prefetch(images: list[Path], prompt: str = 'Extract {"or
         # signal the end
         batch_queue.put(None)
 
-    # Start prefetching thread
     thread = Thread(target=prefetch_worker, daemon=True)
     thread.start()
 
-    # Consume prepared batches
     while True:
         inputs = batch_queue.get()
         if inputs is None:
