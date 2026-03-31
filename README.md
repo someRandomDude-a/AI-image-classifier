@@ -11,7 +11,7 @@ Takes input of images of a given format and extracts the required data such as D
   use `nvidia smi` to check the current version, this project uses cuda 13.x
   If your setup does not support cuda, you can refer to (CPU only environment)[]
 - Step 3:
-  run `pip install uv` and `uv pip install -r requirements.txt`
+  run `pip install uv; uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130; uv pip install -r requirements.txt`
 - Step 4:
   create a `.env` file with the following content:
   
